@@ -1,0 +1,931 @@
+#!/usr/bin/env python3
+"""
+lawnmower_mission.py
+====================
+Fully Autonomous Stop-and-Go Grid Mapping.
+- Auto-generates sequential 'runX' folders.
+- Uses a SIMULATED OpenCV camera to test flight logic without hardware.
+- Fires camera precisely 3s into a 5s hover.
+- Pre-flight ASCII path visualization (Cartesian: +Y=Forward, +X=Right).
+- Actively enforces 10Hz control loop to fight wind and gyro twist.
+- Dynamically accounts for EKF Z-axis (Altitude) drift.
+"""
+
+import time
+import math
+import csv 
+import os
+import threading
+import cv2
+from pymavlink import mavutil
+
+# ═══════════════════════════════════════════════════════════════════
+#  USER CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════
+
+PORT = '/dev/ttyACM0'
+BAUD = 921600
+
+TARGET_ALT_M = 1.0           
+FLIGHT_SPEED_CM_S = 20       
+TOLERANCE_M = 0.2            
+
+# -- Dynamic Grid Settings --
+ARENA_LENGTH_M = 4.5         # Grid Forward/Backward distance (+Y axis)
+ARENA_BREADTH_M = 3.0        # Grid Total width distance (+X axis)
+STEP_M = 1.5                 # Distance to step before pausing
+
+# -- Pause Settings --
+PAUSE_DURATION_S = 5.0       # Total hover time at each dot
+CAMERA_DELAY_S = 3.0         # Wait 3s before triggering camera to stabilize
+
+AUTO_MODE = 'GUIDED'         
+SAFE_MODES = ['STABILIZE', 'LOITER', 'ALT_HOLD']
+
+# ═══════════════════════════════════════════════════════════════════
+
+_current_pos = {'x': 0.0, 'y': 0.0, 'z': 0.0}
+_current_yaw = 0.0 
+_current_mode = None
+_path_history = [] 
+
+def log(tag, msg):
+    print(f"[{tag} {time.strftime('%H:%M:%S')}] {msg}")
+
+# ═══════════════════════════════════════════════════════════════════
+#  CAMERA & FOLDER UTILITIES (SIMULATED)
+# ═══════════════════════════════════════════════════════════════════
+
+def create_run_folder():
+    """Checks existing folders and creates the next sequential run folder."""
+    base_dir = os.getcwd()
+    run_num = 1
+    while True:
+        folder_name = os.path.join(base_dir, f"run{run_num}")
+        if not os.path.exists(folder_name):
+            os.makedirs(folder_name)
+            log("INIT", f"Created new image directory: {folder_name}")
+            return folder_name
+        run_num += 1
+
+class CameraManager:
+    """
+    A simulated Camera Manager.
+    Logs standard operations but does not require a physical camera.
+    """
+    def __init__(self):
+        log("CAMERA", "Initializing OpenCV Camera at 800x600 (MJPEG)...")
+        log("CAMERA", "[MOCK MODE] Hardware calls bypassed for testing.")
+        
+        # Simulate the sensor warm-up time
+        time.sleep(1)
+        
+        # Simulate a successful initial frame read
+        log("CAMERA", "Sensor warmed up successfully.")
+
+    def _capture_thread(self, folder_path, img_name):
+        # Simulate the time it takes to flush the buffer and process an image
+        time.sleep(0.5)
+        
+        filename = os.path.join(folder_path, f"{img_name}.jpg")
+        
+        # Mocking the successful save log
+        log("CAMERA", f"Saved {filename}")
+
+    def trigger(self, folder_path, img_name):
+        """Fires the mock camera in a background thread so the drone doesn't freeze."""
+        threading.Thread(target=self._capture_thread, args=(folder_path, img_name), daemon=True).start()
+
+    def close(self):
+        log("CAMERA", "[MOCK MODE] Camera connection closed.")
+
+def print_path_preview(length_y_m, breadth_x_m, step_m):
+    """Draws a Cartesian ASCII map (Bottom-Left Origin, +X is Right, +Y is Forward)."""
+    num_y = math.ceil(length_y_m / step_m) + 1 # Rows
+    num_x = math.ceil(breadth_x_m / step_m) + 1 # Columns
+    
+    print("\n" + "="*55)
+    print(" FLIGHT PATH PREVIEW (Top-Down View)")
+    print(" ^ Forward (+Y, Row index)")
+    print(" > Right   (+X, Col index)")
+    print("="*55)
+    print(f" Area: {breadth_x_m}m (X) x {length_y_m}m (Y) | Step: {step_m}m | Total Images: {num_x * num_y}\n")
+
+    prefix_len = 11
+
+    # Draw from top (Max Y) down to bottom (Y=0)
+    for y_idx in range(num_y - 1, -1, -1):
+        
+        # 1. Draw the nodes and horizontal steps
+        row_str = f" Y={y_idx*step_m:04.1f}m | "
+        for x_idx in range(num_x):
+            # Format node as [row, col] -> [y_idx, x_idx]
+            node_str = f"[{y_idx},{x_idx}]"
+            row_str += f"{node_str:^7}"
+            
+            if x_idx < num_x - 1:
+                # Top row step right
+                if y_idx == num_y - 1 and x_idx % 2 == 0:
+                    row_str += " -->> "
+                # Bottom row step right
+                elif y_idx == 0 and x_idx % 2 == 1:
+                    row_str += " -->> "
+                else:
+                    row_str += "      "
+        print(row_str)
+
+        # 2. Draw the vertical sweep lines
+        if y_idx > 0:
+            vert_str1 = " " * prefix_len
+            vert_str2 = " " * prefix_len
+            
+            for x_idx in range(num_x):
+                if x_idx % 2 == 0:
+                    # Moving Forward (+Y): ^ at top, | at bottom
+                    vert_str1 += "   ^   "
+                    vert_str2 += "   |   "
+                else:
+                    # Moving Backward (-Y): | at top, v at bottom
+                    vert_str1 += "   |   "
+                    vert_str2 += "   v   "
+                
+                if x_idx < num_x - 1:
+                    vert_str1 += "      "
+                    vert_str2 += "      "
+            
+            print(vert_str1)
+            print(vert_str2)
+
+    # 3. Draw the X-axis labels at the bottom
+    print("-" * (prefix_len + num_x * 7 + (num_x - 1) * 6))
+    x_axis_str = " " * prefix_len
+    for x_idx in range(num_x):
+        label = f"X={x_idx*step_m:02.1f}"
+        x_axis_str += f"{label:^7}"
+        if x_idx < num_x - 1:
+            x_axis_str += "      "
+    print(x_axis_str)
+    print("="*55 + "\n")
+
+# ═══════════════════════════════════════════════════════════════════
+#  FLIGHT CONTROL & TELEMETRY
+# ═══════════════════════════════════════════════════════════════════
+
+def update_telemetry(mav):
+    global _current_pos, _current_yaw, _current_mode
+    while True:
+        msg = mav.recv_match(blocking=False)
+        if not msg:
+            break
+            
+        msg_type = msg.get_type()
+        
+        if msg_type == 'LOCAL_POSITION_NED':
+            _current_pos['x'] = msg.x  
+            _current_pos['y'] = msg.y  
+            _current_pos['z'] = msg.z  
+            
+        elif msg_type == 'ATTITUDE':
+            _current_yaw = msg.yaw 
+            
+        elif msg_type == 'HEARTBEAT':
+            _current_mode = mavutil.mode_string_v10(msg)
+
+def check_safety_pause(mav):
+    global _current_mode
+    update_telemetry(mav)
+    
+    if _current_mode and _current_mode != AUTO_MODE:
+        log("RC OVERRIDE", f"Pilot switched to {_current_mode}! Script yielding control.")
+        while True:
+            update_telemetry(mav)
+            if _current_mode == AUTO_MODE:
+                log("RESUME", f"Mode restored to {AUTO_MODE}. Resuming.")
+                time.sleep(1)
+                break
+            time.sleep(0.1) # 10Hz control loop
+
+def set_fake_origin(mav):
+    log("INIT", "Injecting local origin (0,0)...")
+    mav.mav.set_gps_global_origin_send(mav.target_system, 0, 0, 0)
+    
+    # Using explicit keyword arguments prevents any parameter shifting bugs
+    mav.mav.set_home_position_send(
+        target_system=mav.target_system,
+        latitude=0,
+        longitude=0,
+        altitude=0,
+        x=0,
+        y=0,
+        z=0,
+        q=[1.0, 0.0, 0.0, 0.0],
+        approach_x=0,
+        approach_y=0,
+        approach_z=0
+    )
+    time.sleep(1) 
+
+def set_flight_parameters(mav, speed_cm_s):
+    log("INIT", f"Limiting autonomous speed to {speed_cm_s} cm/s.")
+    mav.mav.param_set_send(
+        mav.target_system, mav.target_component,
+        b'WPNAV_SPEED', float(speed_cm_s), mavutil.mavlink.MAV_PARAM_TYPE_REAL32
+    )
+    log("INIT", "Setting WP_YAW_BEHAVIOR to 0 (Face takeoff direction).")
+    mav.mav.param_set_send(
+        mav.target_system, mav.target_component,
+        b'WP_YAW_BEHAVIOR', 0.0, mavutil.mavlink.MAV_PARAM_TYPE_REAL32
+    )
+
+def send_position_target(mav, target_x, target_y, target_z, target_yaw):
+    mav.mav.set_position_target_local_ned_send(
+        0, mav.target_system, mav.target_component,
+        mavutil.mavlink.MAV_FRAME_LOCAL_NED,
+        int(0b100111111000), 
+        target_x, target_y, target_z,
+        0, 0, 0, 0, 0, 0, 
+        target_yaw, 
+        0    
+    )
+
+def wait_for_takeoff(mav, target_alt, ground_z_ned):
+    log("TAKEOFF", f"Climbing to {target_alt}m...")
+    while True:
+        check_safety_pause(mav)
+        update_telemetry(mav)
+        
+        # Calculate real altitude above the floor
+        current_alt = ground_z_ned - _current_pos['z']
+        print(f"    [DEBUG] Climbing... Alt: {current_alt:.2f}m / {target_alt:.2f}m     ", end='\r')
+        
+        if current_alt >= (target_alt - 0.2):
+            print("") 
+            log("TAKEOFF", "Target altitude reached. Stabilizing...")
+            time.sleep(2) 
+            break
+        time.sleep(0.1) # 10Hz Loop
+
+def go_to_waypoint(mav, x, y, target_alt_m, target_yaw, label, ground_z_ned):
+    # Adjust target Z downward from the floor origin
+    z_ned = ground_z_ned - target_alt_m 
+    
+    while True:
+        check_safety_pause(mav)
+        update_telemetry(mav)
+        
+        dx = x - _current_pos['x']
+        dy = y - _current_pos['y']
+        dz = z_ned - _current_pos['z']
+        distance = math.sqrt(dx**2 + dy**2 + dz**2)
+        
+        print(f"    [DEBUG] Moving to {label} | Dist: {distance:.2f}m     ", end='\r')
+        
+        _path_history.append({
+            'time': round(time.time(), 2),
+            'x': round(_current_pos['x'], 3),
+            'y': round(_current_pos['y'], 3),
+            'z': round(_current_pos['z'], 3)
+        })
+
+        if distance < TOLERANCE_M:
+            print("") 
+            break
+            
+        send_position_target(mav, x, y, z_ned, target_yaw)
+        time.sleep(0.1) # 10Hz Loop
+
+def generate_grid_waypoints(length_y_m, breadth_x_m, step_m):
+    """Generates Cartesian Waypoints (+X is Right, +Y is Forward) and Matrix Indices"""
+    waypoints = []
+    num_passes_x = math.ceil(breadth_x_m / step_m) + 1
+    num_steps_y = math.ceil(length_y_m / step_m) + 1
+    
+    for pass_idx in range(num_passes_x):
+        x = min(pass_idx * step_m, breadth_x_m)
+        x_idx = pass_idx
+        
+        y_indices = list(range(num_steps_y))
+        # Zig-Zag: Reverse Y direction on odd passes (downward sweep)
+        if pass_idx % 2 != 0:
+            y_indices.reverse()
+            
+        for y_idx in y_indices:
+            y = min(y_idx * step_m, length_y_m)
+            waypoints.append((x, y, y_idx, x_idx))
+            
+    return waypoints
+
+def main():
+    log("INIT", "Preparing mission environment...")
+    run_folder = create_run_folder()
+    print_path_preview(ARENA_LENGTH_M, ARENA_BREADTH_M, STEP_M)
+    
+    # Initialize the camera right away
+    camera = CameraManager()
+    
+    log("INIT", "Connecting to Pixhawk...")
+    mav = mavutil.mavlink_connection(PORT, baud=BAUD)
+    mav.wait_heartbeat()
+    
+    mav.mav.request_data_stream_send(
+        mav.target_system, mav.target_component,
+        mavutil.mavlink.MAV_DATA_STREAM_POSITION, 10, 1
+    )
+    mav.mav.request_data_stream_send(
+        mav.target_system, mav.target_component,
+        mavutil.mavlink.MAV_DATA_STREAM_EXTRA1, 10, 1
+    )
+    
+    set_flight_parameters(mav, FLIGHT_SPEED_CM_S)
+    set_fake_origin(mav)
+
+    # Grab the ground Z offset to fix arbitrary EKF coordinate shifts
+    log("INIT", "Sampling ground altitude offset...")
+    for _ in range(20):
+        update_telemetry(mav)
+        time.sleep(0.1)
+    ground_z_ned = _current_pos['z']
+    log("INIT", f"Ground EKF Z-offset recorded: {ground_z_ned:.3f}m")
+
+    try:
+        input(f"[*] Set RC switch to {AUTO_MODE}. Press Enter to START MISSION...")
+        
+        mav.mav.command_long_send(
+            mav.target_system, mav.target_component, 
+            mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 1, 0, 0, 0, 0, 0, 0
+        )
+        log("FLIGHT", "Armed. Motors spinning up...")
+        time.sleep(2) 
+        
+        mav.mav.command_long_send(
+            mav.target_system, mav.target_component,
+            mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0,
+            0, 0, 0, 0, 0, 0, TARGET_ALT_M
+        )
+        wait_for_takeoff(mav, TARGET_ALT_M, ground_z_ned)
+
+        # === LOCK ORIGIN & COMPASS HEADING ===
+        update_telemetry(mav)
+        start_x = _current_pos['x']
+        start_y = _current_pos['y']
+        start_yaw = _current_yaw
+        
+        log("INIT", f"Locked Origin X:{start_x:.2f}, Y:{start_y:.2f}")
+        log("INIT", f"Locked Takeoff Heading: {math.degrees(start_yaw):.1f}° (Compass Agnostic)")
+
+        grid_points = generate_grid_waypoints(ARENA_LENGTH_M, ARENA_BREADTH_M, STEP_M)
+        total_points = len(grid_points)
+
+        for idx, (wp_x, wp_y, y_idx, x_idx) in enumerate(grid_points):
+            
+            # --- ROTATION MATRIX ---
+            # Cartesian to MAVLink Local NED mapping (Forward = wp_y, Right = wp_x)
+            drone_forward = wp_y
+            drone_right = wp_x
+
+            ned_dx = (drone_forward * math.cos(start_yaw)) - (drone_right * math.sin(start_yaw))
+            ned_dy = (drone_forward * math.sin(start_yaw)) + (drone_right * math.cos(start_yaw))
+            
+            real_x = start_x + ned_dx
+            real_y = start_y + ned_dy
+            # -----------------------
+            
+            log("NAV", f"Progress: {idx+1}/{total_points} | Grid: (X={wp_x:.1f}, Y={wp_y:.1f}) -> [{y_idx},{x_idx}]")
+            go_to_waypoint(mav, real_x, real_y, TARGET_ALT_M, start_yaw, f"Point [{y_idx},{x_idx}]", ground_z_ned)
+            
+            # --- 5 SECOND PAUSE & CAMERA TRIGGER ---
+            log("HOVER", f"Holding position for {PAUSE_DURATION_S}s...")
+            pause_start_time = time.time()
+            photo_taken = False
+            
+            while time.time() - pause_start_time < PAUSE_DURATION_S:
+                check_safety_pause(mav)
+                update_telemetry(mav)
+                
+                elapsed = time.time() - pause_start_time
+                
+                # Check if it is time to take the photo (3 seconds into the 5s pause)
+                if elapsed >= CAMERA_DELAY_S and not photo_taken:
+                    photo_taken = True
+                    img_name = f"cap{idx+1}-[{y_idx},{x_idx}]"
+                    log("CAMERA", f"Stabilized. Triggering {img_name}.jpg via OpenCV...")
+                    camera.trigger(run_folder, img_name)
+
+                # Dynamically calculate the visual altitude above floor
+                live_alt = ground_z_ned - _current_pos['z']
+                print(f"    [HOVER {elapsed:.1f}s] Live EKF -> X: {_current_pos['x']:.2f}m, Y: {_current_pos['y']:.2f}m, Alt: {live_alt:.2f}m     ", end='\r')
+                
+                _path_history.append({
+                    'time': round(time.time(), 2),
+                    'x': round(_current_pos['x'], 3),
+                    'y': round(_current_pos['y'], 3),
+                    'z': round(_current_pos['z'], 3)
+                })
+
+                send_position_target(mav, real_x, real_y, ground_z_ned - TARGET_ALT_M, start_yaw)
+                time.sleep(0.1) # 10Hz Loop
+            print("") 
+
+        log("LAND", "Arena coverage complete. Initiating landing.")
+        mav.mav.set_mode_send(mav.target_system, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 9) 
+        
+        while True:
+            update_telemetry(mav)
+            current_alt = ground_z_ned - _current_pos['z']
+            if current_alt < 0.15: 
+                break
+            time.sleep(0.5)
+
+        log("FINISH", "Touchdown. Disarming.")
+        mav.mav.command_long_send(
+            mav.target_system, mav.target_component, 
+            mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 0, 0, 0, 0, 0, 0, 0
+        )
+
+    except KeyboardInterrupt:
+        print("")
+        log("EMERGENCY", "Script aborted via keyboard! Drone holding position.")
+    finally:
+        camera.close() # Free the camera port
+        
+        if _path_history:
+            log_filename = f"drone_path_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+            log("LOG", f"Saving local EKF coordinates to {log_filename}")
+            try:
+                with open(log_filename, 'w', newline='') as f:
+                    writer = csv.DictWriter(f, fieldnames=['time', 'x', 'y', 'z'])
+                    writer.writeheader()
+                    writer.writerows(_path_history)
+                log("LOG", "Coordinates saved successfully.")
+            except Exception as e:
+                log("ERROR", f"Could not save CSV: {e}")
+        
+        mav.close()
+
+if __name__ == "__main__":
+    main()#!/usr/bin/env python3
+"""
+lawnmower_mission.py
+====================
+Fully Autonomous Stop-and-Go Grid Mapping.
+- Auto-generates sequential 'runX' folders.
+- Uses a SIMULATED OpenCV camera to test flight logic without hardware.
+- Fires camera precisely 3s into a 5s hover.
+- Pre-flight ASCII path visualization (Cartesian: +Y=Forward, +X=Right).
+- Actively enforces 10Hz control loop to fight wind and gyro twist.
+- Dynamically accounts for EKF Z-axis (Altitude) drift.
+"""
+
+import time
+import math
+import csv 
+import os
+import threading
+import cv2
+from pymavlink import mavutil
+
+# ═══════════════════════════════════════════════════════════════════
+#  USER CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════
+
+PORT = '/dev/ttyACM0'
+BAUD = 921600
+
+TARGET_ALT_M = 1.0           
+FLIGHT_SPEED_CM_S = 20       
+TOLERANCE_M = 0.2            
+
+# -- Dynamic Grid Settings --
+ARENA_LENGTH_M = 6.0         # Grid Forward/Backward distance (+Y axis)
+ARENA_BREADTH_M = 8.5        # Grid Total width distance (+X axis)
+STEP_M = 2.0                 # Distance to step before pausing
+
+# -- Pause Settings --
+PAUSE_DURATION_S = 5.0       # Total hover time at each dot
+CAMERA_DELAY_S = 3.0         # Wait 3s before triggering camera to stabilize
+
+AUTO_MODE = 'GUIDED'         
+SAFE_MODES = ['STABILIZE', 'LOITER', 'ALT_HOLD']
+
+# ═══════════════════════════════════════════════════════════════════
+
+_current_pos = {'x': 0.0, 'y': 0.0, 'z': 0.0}
+_current_yaw = 0.0 
+_current_mode = None
+_path_history = [] 
+
+def log(tag, msg):
+    print(f"[{tag} {time.strftime('%H:%M:%S')}] {msg}")
+
+# ═══════════════════════════════════════════════════════════════════
+#  CAMERA & FOLDER UTILITIES (SIMULATED)
+# ═══════════════════════════════════════════════════════════════════
+
+def create_run_folder():
+    """Checks existing folders and creates the next sequential run folder."""
+    base_dir = os.getcwd()
+    run_num = 1
+    while True:
+        folder_name = os.path.join(base_dir, f"run{run_num}")
+        if not os.path.exists(folder_name):
+            os.makedirs(folder_name)
+            log("INIT", f"Created new image directory: {folder_name}")
+            return folder_name
+        run_num += 1
+
+class CameraManager:
+    """
+    A simulated Camera Manager.
+    Logs standard operations but does not require a physical camera.
+    """
+    def __init__(self):
+        log("CAMERA", "Initializing OpenCV Camera at 800x600 (MJPEG)...")
+        log("CAMERA", "[MOCK MODE] Hardware calls bypassed for testing.")
+        
+        # Simulate the sensor warm-up time
+        time.sleep(1)
+        
+        # Simulate a successful initial frame read
+        log("CAMERA", "Sensor warmed up successfully.")
+
+    def _capture_thread(self, folder_path, img_name):
+        # Simulate the time it takes to flush the buffer and process an image
+        time.sleep(0.5)
+        
+        filename = os.path.join(folder_path, f"{img_name}.jpg")
+        
+        # Mocking the successful save log
+        log("CAMERA", f"Saved {filename}")
+
+    def trigger(self, folder_path, img_name):
+        """Fires the mock camera in a background thread so the drone doesn't freeze."""
+        threading.Thread(target=self._capture_thread, args=(folder_path, img_name), daemon=True).start()
+
+    def close(self):
+        log("CAMERA", "[MOCK MODE] Camera connection closed.")
+
+def print_path_preview(length_y_m, breadth_x_m, step_m):
+    """Draws a Cartesian ASCII map (Bottom-Left Origin, +X is Right, +Y is Forward)."""
+    num_y = math.ceil(length_y_m / step_m) + 1 # Rows
+    num_x = math.ceil(breadth_x_m / step_m) + 1 # Columns
+    
+    print("\n" + "="*55)
+    print(" FLIGHT PATH PREVIEW (Top-Down View)")
+    print(" ^ Forward (+Y, Row index)")
+    print(" > Right   (+X, Col index)")
+    print("="*55)
+    print(f" Area: {breadth_x_m}m (X) x {length_y_m}m (Y) | Step: {step_m}m | Total Images: {num_x * num_y}\n")
+
+    prefix_len = 11
+
+    # Draw from top (Max Y) down to bottom (Y=0)
+    for y_idx in range(num_y - 1, -1, -1):
+        
+        # 1. Draw the nodes and horizontal steps
+        row_str = f" Y={y_idx*step_m:04.1f}m | "
+        for x_idx in range(num_x):
+            # Format node as [row, col] -> [y_idx, x_idx]
+            node_str = f"[{y_idx},{x_idx}]"
+            row_str += f"{node_str:^7}"
+            
+            if x_idx < num_x - 1:
+                # Top row step right
+                if y_idx == num_y - 1 and x_idx % 2 == 0:
+                    row_str += " -->> "
+                # Bottom row step right
+                elif y_idx == 0 and x_idx % 2 == 1:
+                    row_str += " -->> "
+                else:
+                    row_str += "      "
+        print(row_str)
+
+        # 2. Draw the vertical sweep lines
+        if y_idx > 0:
+            vert_str1 = " " * prefix_len
+            vert_str2 = " " * prefix_len
+            
+            for x_idx in range(num_x):
+                if x_idx % 2 == 0:
+                    # Moving Forward (+Y): ^ at top, | at bottom
+                    vert_str1 += "   ^   "
+                    vert_str2 += "   |   "
+                else:
+                    # Moving Backward (-Y): | at top, v at bottom
+                    vert_str1 += "   |   "
+                    vert_str2 += "   v   "
+                
+                if x_idx < num_x - 1:
+                    vert_str1 += "      "
+                    vert_str2 += "      "
+            
+            print(vert_str1)
+            print(vert_str2)
+
+    # 3. Draw the X-axis labels at the bottom
+    print("-" * (prefix_len + num_x * 7 + (num_x - 1) * 6))
+    x_axis_str = " " * prefix_len
+    for x_idx in range(num_x):
+        label = f"X={x_idx*step_m:02.1f}"
+        x_axis_str += f"{label:^7}"
+        if x_idx < num_x - 1:
+            x_axis_str += "      "
+    print(x_axis_str)
+    print("="*55 + "\n")
+
+# ═══════════════════════════════════════════════════════════════════
+#  FLIGHT CONTROL & TELEMETRY
+# ═══════════════════════════════════════════════════════════════════
+
+def update_telemetry(mav):
+    global _current_pos, _current_yaw, _current_mode
+    while True:
+        msg = mav.recv_match(blocking=False)
+        if not msg:
+            break
+            
+        msg_type = msg.get_type()
+        
+        if msg_type == 'LOCAL_POSITION_NED':
+            _current_pos['x'] = msg.x  
+            _current_pos['y'] = msg.y  
+            _current_pos['z'] = msg.z  
+            
+        elif msg_type == 'ATTITUDE':
+            _current_yaw = msg.yaw 
+            
+        elif msg_type == 'HEARTBEAT':
+            _current_mode = mavutil.mode_string_v10(msg)
+
+def check_safety_pause(mav):
+    global _current_mode
+    update_telemetry(mav)
+    
+    if _current_mode and _current_mode != AUTO_MODE:
+        log("RC OVERRIDE", f"Pilot switched to {_current_mode}! Script yielding control.")
+        while True:
+            update_telemetry(mav)
+            if _current_mode == AUTO_MODE:
+                log("RESUME", f"Mode restored to {AUTO_MODE}. Resuming.")
+                time.sleep(1)
+                break
+            time.sleep(0.1) # 10Hz control loop
+
+def set_fake_origin(mav):
+    log("INIT", "Injecting local origin (0,0)...")
+    mav.mav.set_gps_global_origin_send(mav.target_system, 0, 0, 0)
+    
+    # Using explicit keyword arguments prevents any parameter shifting bugs
+    mav.mav.set_home_position_send(
+        target_system=mav.target_system,
+        latitude=0,
+        longitude=0,
+        altitude=0,
+        x=0,
+        y=0,
+        z=0,
+        q=[1.0, 0.0, 0.0, 0.0],
+        approach_x=0,
+        approach_y=0,
+        approach_z=0
+    )
+    time.sleep(1) 
+
+def set_flight_parameters(mav, speed_cm_s):
+    log("INIT", f"Limiting autonomous speed to {speed_cm_s} cm/s.")
+    mav.mav.param_set_send(
+        mav.target_system, mav.target_component,
+        b'WPNAV_SPEED', float(speed_cm_s), mavutil.mavlink.MAV_PARAM_TYPE_REAL32
+    )
+    log("INIT", "Setting WP_YAW_BEHAVIOR to 0 (Face takeoff direction).")
+    mav.mav.param_set_send(
+        mav.target_system, mav.target_component,
+        b'WP_YAW_BEHAVIOR', 0.0, mavutil.mavlink.MAV_PARAM_TYPE_REAL32
+    )
+
+def send_position_target(mav, target_x, target_y, target_z, target_yaw):
+    mav.mav.set_position_target_local_ned_send(
+        0, mav.target_system, mav.target_component,
+        mavutil.mavlink.MAV_FRAME_LOCAL_NED,
+        int(0b100111111000), 
+        target_x, target_y, target_z,
+        0, 0, 0, 0, 0, 0, 
+        target_yaw, 
+        0    
+    )
+
+def wait_for_takeoff(mav, target_alt, ground_z_ned):
+    log("TAKEOFF", f"Climbing to {target_alt}m...")
+    while True:
+        check_safety_pause(mav)
+        update_telemetry(mav)
+        
+        # Calculate real altitude above the floor
+        current_alt = ground_z_ned - _current_pos['z']
+        print(f"    [DEBUG] Climbing... Alt: {current_alt:.2f}m / {target_alt:.2f}m     ", end='\r')
+        
+        if current_alt >= (target_alt - 0.2):
+            print("") 
+            log("TAKEOFF", "Target altitude reached. Stabilizing...")
+            time.sleep(2) 
+            break
+        time.sleep(0.1) # 10Hz Loop
+
+def go_to_waypoint(mav, x, y, target_alt_m, target_yaw, label, ground_z_ned):
+    # Adjust target Z downward from the floor origin
+    z_ned = ground_z_ned - target_alt_m 
+    
+    while True:
+        check_safety_pause(mav)
+        update_telemetry(mav)
+        
+        dx = x - _current_pos['x']
+        dy = y - _current_pos['y']
+        dz = z_ned - _current_pos['z']
+        distance = math.sqrt(dx**2 + dy**2 + dz**2)
+        
+        print(f"    [DEBUG] Moving to {label} | Dist: {distance:.2f}m     ", end='\r')
+        
+        _path_history.append({
+            'time': round(time.time(), 2),
+            'x': round(_current_pos['x'], 3),
+            'y': round(_current_pos['y'], 3),
+            'z': round(_current_pos['z'], 3)
+        })
+
+        if distance < TOLERANCE_M:
+            print("") 
+            break
+            
+        send_position_target(mav, x, y, z_ned, target_yaw)
+        time.sleep(0.1) # 10Hz Loop
+
+def generate_grid_waypoints(length_y_m, breadth_x_m, step_m):
+    """Generates Cartesian Waypoints (+X is Right, +Y is Forward) and Matrix Indices"""
+    waypoints = []
+    num_passes_x = math.ceil(breadth_x_m / step_m) + 1
+    num_steps_y = math.ceil(length_y_m / step_m) + 1
+    
+    for pass_idx in range(num_passes_x):
+        x = min(pass_idx * step_m, breadth_x_m)
+        x_idx = pass_idx
+        
+        y_indices = list(range(num_steps_y))
+        # Zig-Zag: Reverse Y direction on odd passes (downward sweep)
+        if pass_idx % 2 != 0:
+            y_indices.reverse()
+            
+        for y_idx in y_indices:
+            y = min(y_idx * step_m, length_y_m)
+            waypoints.append((x, y, y_idx, x_idx))
+            
+    return waypoints
+
+def main():
+    log("INIT", "Preparing mission environment...")
+    run_folder = create_run_folder()
+    print_path_preview(ARENA_LENGTH_M, ARENA_BREADTH_M, STEP_M)
+    
+    # Initialize the camera right away
+    camera = CameraManager()
+    
+    log("INIT", "Connecting to Pixhawk...")
+    mav = mavutil.mavlink_connection(PORT, baud=BAUD)
+    mav.wait_heartbeat()
+    
+    mav.mav.request_data_stream_send(
+        mav.target_system, mav.target_component,
+        mavutil.mavlink.MAV_DATA_STREAM_POSITION, 10, 1
+    )
+    mav.mav.request_data_stream_send(
+        mav.target_system, mav.target_component,
+        mavutil.mavlink.MAV_DATA_STREAM_EXTRA1, 10, 1
+    )
+    
+    set_flight_parameters(mav, FLIGHT_SPEED_CM_S)
+    set_fake_origin(mav)
+
+    # Grab the ground Z offset to fix arbitrary EKF coordinate shifts
+    log("INIT", "Sampling ground altitude offset...")
+    for _ in range(20):
+        update_telemetry(mav)
+        time.sleep(0.1)
+    ground_z_ned = _current_pos['z']
+    log("INIT", f"Ground EKF Z-offset recorded: {ground_z_ned:.3f}m")
+
+    try:
+        input(f"[*] Set RC switch to {AUTO_MODE}. Press Enter to START MISSION...")
+        
+        mav.mav.command_long_send(
+            mav.target_system, mav.target_component, 
+            mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 1, 0, 0, 0, 0, 0, 0
+        )
+        log("FLIGHT", "Armed. Motors spinning up...")
+        time.sleep(2) 
+        
+        mav.mav.command_long_send(
+            mav.target_system, mav.target_component,
+            mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0,
+            0, 0, 0, 0, 0, 0, TARGET_ALT_M
+        )
+        wait_for_takeoff(mav, TARGET_ALT_M, ground_z_ned)
+
+        # === LOCK ORIGIN & COMPASS HEADING ===
+        update_telemetry(mav)
+        start_x = _current_pos['x']
+        start_y = _current_pos['y']
+        start_yaw = _current_yaw
+        
+        log("INIT", f"Locked Origin X:{start_x:.2f}, Y:{start_y:.2f}")
+        log("INIT", f"Locked Takeoff Heading: {math.degrees(start_yaw):.1f}° (Compass Agnostic)")
+
+        grid_points = generate_grid_waypoints(ARENA_LENGTH_M, ARENA_BREADTH_M, STEP_M)
+        total_points = len(grid_points)
+
+        for idx, (wp_x, wp_y, y_idx, x_idx) in enumerate(grid_points):
+            
+            # --- ROTATION MATRIX ---
+            # Cartesian to MAVLink Local NED mapping (Forward = wp_y, Right = wp_x)
+            drone_forward = wp_y
+            drone_right = wp_x
+
+            ned_dx = (drone_forward * math.cos(start_yaw)) - (drone_right * math.sin(start_yaw))
+            ned_dy = (drone_forward * math.sin(start_yaw)) + (drone_right * math.cos(start_yaw))
+            
+            real_x = start_x + ned_dx
+            real_y = start_y + ned_dy
+            # -----------------------
+            
+            log("NAV", f"Progress: {idx+1}/{total_points} | Grid: (X={wp_x:.1f}, Y={wp_y:.1f}) -> [{y_idx},{x_idx}]")
+            go_to_waypoint(mav, real_x, real_y, TARGET_ALT_M, start_yaw, f"Point [{y_idx},{x_idx}]", ground_z_ned)
+            
+            # --- 5 SECOND PAUSE & CAMERA TRIGGER ---
+            log("HOVER", f"Holding position for {PAUSE_DURATION_S}s...")
+            pause_start_time = time.time()
+            photo_taken = False
+            
+            while time.time() - pause_start_time < PAUSE_DURATION_S:
+                check_safety_pause(mav)
+                update_telemetry(mav)
+                
+                elapsed = time.time() - pause_start_time
+                
+                # Check if it is time to take the photo (3 seconds into the 5s pause)
+                if elapsed >= CAMERA_DELAY_S and not photo_taken:
+                    photo_taken = True
+                    img_name = f"cap{idx+1}-[{y_idx},{x_idx}]"
+                    log("CAMERA", f"Stabilized. Triggering {img_name}.jpg via OpenCV...")
+                    camera.trigger(run_folder, img_name)
+
+                # Dynamically calculate the visual altitude above floor
+                live_alt = ground_z_ned - _current_pos['z']
+                print(f"    [HOVER {elapsed:.1f}s] Live EKF -> X: {_current_pos['x']:.2f}m, Y: {_current_pos['y']:.2f}m, Alt: {live_alt:.2f}m     ", end='\r')
+                
+                _path_history.append({
+                    'time': round(time.time(), 2),
+                    'x': round(_current_pos['x'], 3),
+                    'y': round(_current_pos['y'], 3),
+                    'z': round(_current_pos['z'], 3)
+                })
+
+                send_position_target(mav, real_x, real_y, ground_z_ned - TARGET_ALT_M, start_yaw)
+                time.sleep(0.1) # 10Hz Loop
+            print("") 
+
+        log("LAND", "Arena coverage complete. Initiating landing.")
+        mav.mav.set_mode_send(mav.target_system, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 9) 
+        
+        while True:
+            update_telemetry(mav)
+            current_alt = ground_z_ned - _current_pos['z']
+            if current_alt < 0.15: 
+                break
+            time.sleep(0.5)
+
+        log("FINISH", "Touchdown. Disarming.")
+        mav.mav.command_long_send(
+            mav.target_system, mav.target_component, 
+            mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 0, 0, 0, 0, 0, 0, 0
+        )
+
+    except KeyboardInterrupt:
+        print("")
+        log("EMERGENCY", "Script aborted via keyboard! Drone holding position.")
+    finally:
+        camera.close() # Free the camera port
+        
+        if _path_history:
+            log_filename = f"drone_path_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+            log("LOG", f"Saving local EKF coordinates to {log_filename}")
+            try:
+                with open(log_filename, 'w', newline='') as f:
+                    writer = csv.DictWriter(f, fieldnames=['time', 'x', 'y', 'z'])
+                    writer.writeheader()
+                    writer.writerows(_path_history)
+                log("LOG", "Coordinates saved successfully.")
+            except Exception as e:
+                log("ERROR", f"Could not save CSV: {e}")
+        
+        mav.close()
+
+if __name__ == "__main__":
+    main()

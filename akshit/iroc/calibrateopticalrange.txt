@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""
+calibrate_optical_flow.py
+=========================
+A precise, step-by-step diagnostic flight to measure and calibrate 
+Laser Rangefinder altitude and Optical Flow X/Y scaling.
+"""
+
+import time
+import math
+from pymavlink import mavutil
+
+PORT = '/dev/ttyACM0'
+BAUD = 921600
+
+# -- Calibration Settings --
+CALIB_ALT_M = 1.0           # Height to test (1.0m makes math easy)
+CALIB_DIST_M = 2.0          # Distance to travel on X and Y axes
+PAUSE_S = 15.0              # Seconds to hover so you can measure with a tape measure
+FLIGHT_SPEED_CM_S = 20      
+
+AUTO_MODE = 'GUIDED'         
+
+_current_pos = {'x': 0.0, 'y': 0.0, 'z': 0.0}
+_current_yaw = 0.0
+_current_mode = None
+
+def log(tag, msg):
+    print(f"[{tag} {time.strftime('%H:%M:%S')}] {msg}")
+
+def update_telemetry(mav):
+    global _current_pos, _current_yaw, _current_mode
+    while True:
+        msg = mav.recv_match(blocking=False)
+        if not msg:
+            break
+        msg_type = msg.get_type()
+        if msg_type == 'LOCAL_POSITION_NED':
+            _current_pos['x'] = msg.x  
+            _current_pos['y'] = msg.y  
+            _current_pos['z'] = msg.z  
+        elif msg_type == 'ATTITUDE':
+            _current_yaw = msg.yaw 
+        elif msg_type == 'HEARTBEAT':
+            _current_mode = mavutil.mode_string_v10(msg)
+
+def set_fake_origin(mav):
+    log("INIT", "Injecting local origin (0,0)...")
+    mav.mav.set_gps_global_origin_send(mav.target_system, 0, 0, 0)
+    mav.mav.set_home_position_send(
+        mav.target_system, 0, 0, 0, 0, 0, 0, [1.0, 0.0, 0.0, 0.0], 0, 0, 0
+    )
+    time.sleep(1) 
+
+def set_flight_parameters(mav, speed_cm_s):
+    mav.mav.param_set_send(mav.target_system, mav.target_component, b'WPNAV_SPEED', float(speed_cm_s), mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
+    mav.mav.param_set_send(mav.target_system, mav.target_component, b'WP_YAW_BEHAVIOR', 0.0, mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
+
+def send_position_target(mav, target_x, target_y, target_z, target_yaw):
+    mav.mav.set_position_target_local_ned_send(
+        0, mav.target_system, mav.target_component,
+        mavutil.mavlink.MAV_FRAME_LOCAL_NED,
+        int(0b100111111000), target_x, target_y, target_z,
+        0, 0, 0, 0, 0, 0, target_yaw, 0    
+    )
+
+def hold_position_for_measurement(mav, x, y, z_alt, target_yaw, duration, label):
+    log("MEASURE", f"*** HOLDING AT {label} FOR {duration} SECONDS ***")
+    log("MEASURE", f"Get your tape measure! Expected -> X: {x}m, Y: {y}m, Alt: {z_alt}m")
+    
+    start_time = time.time()
+    while time.time() - start_time < duration:
+        update_telemetry(mav)
+        send_position_target(mav, x, y, -z_alt, target_yaw)
+        
+        elapsed = time.time() - start_time
+        print(f"    [Time Left: {duration - elapsed:.1f}s] Live Z: {-_current_pos['z']:.2f}m     ", end='\r')
+        time.sleep(0.2)
+    print("")
+
+def go_to_waypoint(mav, x, y, z_alt, target_yaw, label):
+    z_ned = -z_alt 
+    log("TARGET", f"Moving to {label}...")
+    while True:
+        update_telemetry(mav)
+        dx = x - _current_pos['x']
+        dy = y - _current_pos['y']
+        dz = z_ned - _current_pos['z']
+        distance = math.sqrt(dx**2 + dy**2 + dz**2)
+        print(f"    [DEBUG] Moving to {label} | Dist: {distance:.2f}m     ", end='\r')
+        if distance < 0.2:
+            print("") 
+            break
+        send_position_target(mav, x, y, z_ned, target_yaw)
+        time.sleep(0.2) 
+
+def main():
+    log("INIT", "Connecting to Pixhawk...")
+    mav = mavutil.mavlink_connection(PORT, baud=BAUD)
+    mav.wait_heartbeat()
+    
+    mav.mav.request_data_stream_send(mav.target_system, mav.target_component, mavutil.mavlink.MAV_DATA_STREAM_POSITION, 10, 1)
+    mav.mav.request_data_stream_send(mav.target_system, mav.target_component, mavutil.mavlink.MAV_DATA_STREAM_EXTRA1, 10, 1)
+    
+    set_flight_parameters(mav, FLIGHT_SPEED_CM_S)
+    set_fake_origin(mav)
+
+    try:
+        input(f"[*] Set RC switch to {AUTO_MODE}. Press Enter to START CALIBRATION...")
+        
+        mav.mav.command_long_send(mav.target_system, mav.target_component, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 1, 0, 0, 0, 0, 0, 0)
+        time.sleep(2) 
+        
+        mav.mav.command_long_send(mav.target_system, mav.target_component, mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0, 0, 0, 0, 0, 0, 0, CALIB_ALT_M)
+        
+        # Wait for climb
+        while True:
+            update_telemetry(mav)
+            if -_current_pos['z'] >= (CALIB_ALT_M - 0.2):
+                break
+            time.sleep(0.2)
+
+        # Lock Origin
+        update_telemetry(mav)
+        start_x, start_y, start_yaw = _current_pos['x'], _current_pos['y'], _current_yaw
+
+        # STEP 1: TEST ALTITUDE
+        hold_position_for_measurement(mav, start_x, start_y, CALIB_ALT_M, start_yaw, PAUSE_S, "TAKEOFF POINT (CHECK HEIGHT)")
+
+        # STEP 2: TEST X AXIS (FORWARD)
+        ned_dx = (CALIB_DIST_M * math.cos(start_yaw)) - (0 * math.sin(start_yaw))
+        ned_dy = (CALIB_DIST_M * math.sin(start_yaw)) + (0 * math.cos(start_yaw))
+        target_x = start_x + ned_dx
+        target_y = start_y + ned_dy
+        
+        go_to_waypoint(mav, target_x, target_y, CALIB_ALT_M, start_yaw, "FORWARD 2M")
+        hold_position_for_measurement(mav, target_x, target_y, CALIB_ALT_M, start_yaw, PAUSE_S, "X-AXIS (CHECK FORWARD DISTANCE)")
+
+        # STEP 3: TEST Y AXIS (RIGHT)
+        ned_dx = (CALIB_DIST_M * math.cos(start_yaw)) - (CALIB_DIST_M * math.sin(start_yaw))
+        ned_dy = (CALIB_DIST_M * math.sin(start_yaw)) + (CALIB_DIST_M * math.cos(start_yaw))
+        target_x = start_x + ned_dx
+        target_y = start_y + ned_dy
+        
+        go_to_waypoint(mav, target_x, target_y, CALIB_ALT_M, start_yaw, "RIGHT 2M")
+        hold_position_for_measurement(mav, target_x, target_y, CALIB_ALT_M, start_yaw, PAUSE_S, "Y-AXIS (CHECK RIGHT SIDE DISTANCE)")
+
+        # LAND
+        log("LAND", "Calibration flight complete. Landing.")
+        mav.mav.set_mode_send(mav.target_system, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 9) 
+        
+        while True:
+            update_telemetry(mav)
+            if _current_pos['z'] > -0.15: 
+                break
+            time.sleep(0.5)
+
+        mav.mav.command_long_send(mav.target_system, mav.target_component, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 0, 0, 0, 0, 0, 0, 0)
+
+    except KeyboardInterrupt:
+        log("EMERGENCY", "Script aborted! Drone holding position.")
+    finally:
+        mav.close()
+
+if __name__ == "__main__":
+    main()

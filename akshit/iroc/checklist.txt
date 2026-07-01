@@ -1,0 +1,42 @@
+To get your drone flying perfectly autonomously indoors using Optical Flow and the Laser Rangefinder, here is the master checklist of all the parameters you need to set in Mission Planner.
+
+I have grouped them by category so you can easily go down the **Config > Full Parameter List** tab and verify each one.
+
+### 1. EKF3 (The Brain) & Sensors
+
+These settings tell the drone's brain to completely ignore GPS and the Barometer, and trust *only* your Optical Flow and Rangefinder.
+
+* **`AHRS_EKF_TYPE` = 3** (Tells the drone to use the modern EKF3 algorithm, which is best for non-GPS flight).
+* **`EK3_SRC1_POSXY` = 0** (None. Tells it not to look for a GPS for horizontal position).
+* **`EK3_SRC1_VELXY` = 2** (OpticalFlow. Tells it to use the camera for horizontal speed/movement).
+* **`EK3_SRC1_POSZ` = 2** (RangeFinder. **Crucial:** This tells the drone to completely ignore the Barometer and use the Laser Rangefinder for its height. This stops the bouncy altitude).
+* **`EK3_SRC1_VELZ` = 0** (None).
+
+### 2. Compass Settings (To stop Gyro Creep / Diagonal Twist)
+
+Since we want the drone to hold a perfectly straight heading without you having to manually correct it with the RC sticks, we need the compass ON to provide an absolute "North" anchor.
+
+* **`COMPASS_USE` = 1** (Enables the primary compass).
+* **`COMPASS_USE2` = 1** (Enables the secondary compass, if your hardware has one).
+* **`COMPASS_USE3` = 1** (Enables the tertiary compass, if your hardware has one).
+
+### 3. GPS & Arming Safety Checks
+
+Because you don't have a GPS, the Pixhawk will refuse to arm unless you turn off the GPS safety check.
+
+* **`GPS_TYPE` = 0** (Disables the GPS module entirely).
+* **`ARMING_CHECK`** = Click the "Find" button for this parameter. Uncheck the box for **"GPS"**, but leave the others (like IMU, Baro, Battery) checked for safety.
+
+### 4. Calibration Parameters (You will tune these with the script)
+
+These are the parameters you will actively change based on the results from the `calibrate_optical_flow.py` script.
+
+* **`RNGFND1_SCALING`** (Usually starts at `1.0`. Change this if the drone thinks 1 meter is actually 0.8m or 1.2m).
+* **`FLOW_FXSCALER`** (Usually starts at `0`. Tunes your Forward/Backward X-axis distance).
+* **`FLOW_FYSCALER`** (Usually starts at `0`. Tunes your Left/Right Y-axis distance).
+
+### 5. Flight Modes
+
+* **`FLTMODE1`** (or whichever switch you use): Must be set to **`GUIDED`**. The Python script will absolutely not work unless the drone is in this mode.
+
+Once you verify these parameters, run the `calibrate_optical_flow.py` script to get your scaler numbers, plug those numbers into Mission Planner, reboot the flight controller, and you will be ready to fly the automated 2x2m grid!

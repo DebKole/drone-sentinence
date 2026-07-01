@@ -1,0 +1,32 @@
+2026-06-16 12:54:44,371  INFO      ============================================================
+2026-06-16 12:54:44,372  INFO        SORTIE 1 — LAWNMOWER COVERAGE
+2026-06-16 12:54:44,372  INFO      ============================================================
+2026-06-16 12:54:44,372  INFO      Camera: save directory → /workspace/sortie1_images
+2026-06-16 12:54:44,534  INFO      Camera: opened /dev/video0  resolution=1280x720
+2026-06-16 12:54:44,534  INFO      Camera: warming up (5 frames) …
+2026-06-16 12:54:45,925  INFO      Camera: ready
+2026-06-16 12:54:45,926  INFO      Lawnmower: 16 waypoints, 5.3 m × 3.8 m, spacing 0.5 m
+2026-06-16 12:54:45,926  INFO      Connecting to FC at /dev/ttyACM0 baud=921600 …
+2026-06-16 12:54:45,937  INFO      Waiting for HEARTBEAT …
+2026-06-16 12:54:45,987  INFO      Heartbeat received — system 1 component 0
+2026-06-16 12:54:45,988  INFO      Airspeed set to 0.5 m/s
+2026-06-16 12:54:45,988  INFO      Mode → GUIDED (id=4)
+2026-06-16 12:54:45,996  INFO      Mode confirmed: GUIDED
+2026-06-16 12:54:45,997  INFO      Waiting for EKF local position lock (GPS-denied) and pre-arm checks …
+2026-06-16 12:55:09,971  WARNING   Mission aborted by operator (Ctrl-C).
+2026-06-16 13:00:12,687  INFO      ============================================================
+2026-06-16 13:00:12,687  INFO        SORTIE 1 — LAWNMOWER COVERAGE
+2026-06-16 13:00:12,688  INFO      ============================================================
+2026-06-16 13:00:12,688  INFO      Camera: save directory → /workspace/sortie1_images
+2026-06-16 13:00:12,846  INFO      Camera: opened /dev/video0  resolution=1280x720
+2026-06-16 13:00:12,846  INFO      Camera: warming up (5 frames) …
+2026-06-16 13:00:14,270  INFO      Camera: ready
+2026-06-16 13:00:14,271  INFO      Lawnmower: 16 waypoints, 5.3 m × 3.8 m, spacing 0.5 m
+2026-06-16 13:00:14,271  INFO      Connecting to FC at /dev/ttyACM0 baud=921600 …
+2026-06-16 13:00:14,282  INFO      Waiting for HEARTBEAT …
+2026-06-16 13:00:14,331  INFO      Heartbeat received — system 1 component 0
+2026-06-16 13:00:14,331  INFO      Airspeed set to 0.5 m/s
+2026-06-16 13:00:14,332  INFO      Mode → LOITER (id=5)
+2026-06-16 13:00:14,338  INFO      Mode confirmed: LOITER
+2026-06-16 13:00:14,339  INFO      Waiting for EKF local position lock (GPS-denied) and pre-arm checks …
+2026-06-16 13:00:37,683  WARNING   Mission aborted by operator (Ctrl-C).
